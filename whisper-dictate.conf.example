@@ -1,0 +1,24 @@
+# Copy to ~/.config/whisper-dictate.conf and edit. Plain KEY=VALUE lines,
+# read by bash: quote any value containing spaces. Every line is optional.
+
+# Where to send audio. Any OpenAI-compatible transcription endpoint works.
+WHISPER_URL="http://localhost:8080/v1/audio/transcriptions"
+WHISPER_API_KEY="none"         # only needed for OpenAI or a gated server
+WHISPER_MODEL="whisper-1"      # most self-hosted servers ignore this
+WHISPER_LANGUAGE="en"
+
+# Proper nouns and jargon you actually say. Whisper conditions on this text,
+# so it is the cheapest accuracy improvement available.
+WHISPER_PROMPT="Your Name, Your Employer, your city, your field's jargon."
+
+AUTO_PASTE=1        # paste into the focused window; 0 = clipboard only
+PASTE_MODE=key      # key = Ctrl+V (Ctrl+Shift+V in terminals); type = xdotool type
+MAX_SECONDS=300     # auto-stop and transcribe after this long
+
+SOUND=1             # 0 = silent
+SOUND_VOLUME=40     # percent
+# Any name from /usr/share/sounds/freedesktop/stereo/, or "" to skip that cue.
+SOUND_START="message-new-instant"
+SOUND_TRANSCRIBING="dialog-information"
+SOUND_DONE="complete"
+SOUND_ERROR="dialog-error"

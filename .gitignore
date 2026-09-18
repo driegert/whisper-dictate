@@ -1,0 +1,9 @@
+# Personal config lives in ~/.config/whisper-dictate.conf, never here.
+.env
+*.conf
+!*.conf.example
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+#
+# whisper-dictate — toggle-style dictation against any OpenAI-compatible
+# speech-to-text endpoint (whisper.cpp, faster-whisper, vLLM, OpenAI, ...).
+#
+# Bind this to a single hotkey. Press once to start recording, press again to
+# stop; the transcript is pasted into the focused window (and left on the
+# clipboard). No daemon, no background process between uses.
+#
+# Dependencies: curl, python3, and one of pw-record / parecord / arecord.
+#               xclip / xsel (X11) or wl-copy (Wayland) for the clipboard.
+#               xdotool + xprop (X11) or ydotool (Wayland) for AUTO_PASTE=1.
+#               notify-send (optional) for feedback.
+#               canberra-gtk-play or paplay (optional) for sound cues.
+#
+# Usage: whisper-dictate [toggle|stop|cancel]
+
+set -uo pipefail
+
+# ---------------------------------------------------------------- configuration
+# Precedence: environment variable > ~/.config/whisper-dictate.conf > the
+# defaults below. The config file is plain KEY=VALUE lines; see
+# whisper-dictate.conf.example.
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/whisper-dictate.conf"
+if [ -r "$CONF" ]; then
+    # Snapshot anything already set in the environment, source the file, then
+    # restore the snapshot so explicit env vars (a second hotkey, a test run)
+    # still win.
+    _env=$(declare -p WHISPER_URL WHISPER_MODEL WHISPER_API_KEY WHISPER_LANGUAGE \
+                      WHISPER_PROMPT AUTO_PASTE PASTE_MODE MAX_SECONDS SOUND \
+                      SOUND_VOLUME SOUND_START SOUND_TRANSCRIBING SOUND_DONE \
+                      SOUND_ERROR 2>/dev/null)
+    # shellcheck source=/dev/null
+    . "$CONF"
+    eval "$_env"
+    unset _env
+fi
+
+WHISPER_URL="${WHISPER_URL:-http://localhost:8080/v1/audio/transcriptions}"
+WHISPER_MODEL="${WHISPER_MODEL:-whisper-1}"   # most self-hosted servers ignore this
+WHISPER_API_KEY="${WHISPER_API_KEY:-none}"    # only OpenAI and gated servers check it
+WHISPER_LANGUAGE="${WHISPER_LANGUAGE:-en}"
+
+# Vocabulary hints. Whisper conditions on this, so listing the proper nouns and
+# jargon you actually say is the single cheapest accuracy win available.
+WHISPER_PROMPT="${WHISPER_PROMPT:-}"
+
+AUTO_PASTE="${AUTO_PASTE:-1}"      # 1 = paste into the focused window after copying
+PASTE_MODE="${PASTE_MODE:-key}"    # key  = simulate Ctrl+V (Ctrl+Shift+V in terminals)
+                                   # type = type the text keystroke by keystroke (X11 only;
+                                   #        works everywhere, slower on long text)
+MAX_SECONDS="${MAX_SECONDS:-300}"  # auto-stop and transcribe after this long
+
+# Sound cues: names from the freedesktop sound theme
+# (see /usr/share/sounds/freedesktop/stereo/). Set one to "" to silence it.
+SOUND="${SOUND:-1}"                # 0 = no sounds at all
+SOUND_VOLUME="${SOUND_VOLUME:-40}" # percent, 100 = the theme's own level
+SOUND_START="${SOUND_START:-message-new-instant}"   # recording started
+SOUND_TRANSCRIBING="${SOUND_TRANSCRIBING:-dialog-information}"  # recording stopped, sent to server
+SOUND_DONE="${SOUND_DONE:-complete}"                # text pasted
+SOUND_ERROR="${SOUND_ERROR:-dialog-error}"          # something failed
+
+# ---------------------------------------------------------------------- state
+RUNTIME="${XDG_RUNTIME_DIR:-/tmp}/whisper-dictate"
+mkdir -p "$RUNTIME"
+PIDFILE="$RUNTIME/record.pid"
+WAVFILE="$RUNTIME/record.wav"
+NIDFILE="$RUNTIME/notify.id"
+
+# ------------------------------------------------------------------- feedback
+# One notification slot, replaced in place, so a dictation doesn't leave a
+# stack of "Recording… / Transcribing… / result" banners behind.
+notify() {
+    command -v notify-send >/dev/null 2>&1 || return 0
+    local -a args=(-a whisper-dictate -t "${2:-2500}" -p)
+    local id
+    id=$(cat "$NIDFILE" 2>/dev/null) && [ -n "$id" ] && args+=(-r "$id")
+    notify-send "${args[@]}" "$1" > "$NIDFILE" 2>/dev/null || true
+}
+
+# Play a theme sound in the background so it never adds latency to the hotkey
+# path. canberra takes a dB gain, paplay a linear 0..65536 value.
+cue() {
+    [ "$SOUND" = "1" ] && [ -n "$1" ] || return 0
+    if command -v canberra-gtk-play >/dev/null 2>&1; then
+        local db
+        db=$(awk -v p="$SOUND_VOLUME" 'BEGIN { if (p <= 0) p = 0.01; printf "%.1f", 20 * log(p / 100) / log(10) }')
+        canberra-gtk-play -i "$1" --volume "$db" >/dev/null 2>&1 &
+    elif command -v paplay >/dev/null 2>&1; then
+        paplay --volume=$(( SOUND_VOLUME * 65536 / 100 )) \
+               "/usr/share/sounds/freedesktop/stereo/$1.oga" >/dev/null 2>&1 &
+    fi
+}
+
+die() { cue "$SOUND_ERROR"; notify "whisper-dictate: $1" 5000; echo "$1" >&2; exit 1; }
+
+# ------------------------------------------------------------------ recording
+start_recording() {
+    rm -f "$WAVFILE"
+
+    if command -v pw-record >/dev/null 2>&1; then
+        pw-record --rate 16000 --channels 1 --format s16 "$WAVFILE" &
+    elif command -v parecord >/dev/null 2>&1; then
+        parecord --rate=16000 --channels=1 --format=s16le \
+                 --file-format=wav "$WAVFILE" &
+    elif command -v arecord >/dev/null 2>&1; then
+        arecord -q -f S16_LE -r 16000 -c 1 -t wav "$WAVFILE" &
+    else
+        die "no recorder found (install pipewire-utils, pulseaudio-utils, or alsa-utils)"
+    fi
+
+    local pid=$!
+    echo "$pid" > "$PIDFILE"
+
+    # Watchdog: if this same recording is still running after MAX_SECONDS,
+    # stop it the normal way so the audio is transcribed rather than lost.
+    # Checking the pid guards against killing a later recording.
+    (
+        sleep "$MAX_SECONDS"
+        [ "$(cat "$PIDFILE" 2>/dev/null)" = "$pid" ] && "$0" stop
+    ) >/dev/null 2>&1 &
+    disown
+
+    cue "$SOUND_START"
+    notify "Recording…" 1200
+}
+
+stop_recording() {
+    local pid
+    pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+    rm -f "$PIDFILE"
+
+    # SIGTERM, not SIGINT: background jobs started from a non-interactive
+    # script have SIGINT ignored, so an INT would never reach the recorder.
+    # The recorder closes the file on TERM and writes a correct WAV header.
+    kill -TERM "$pid" 2>/dev/null || true
+    local i
+    for i in $(seq 1 60); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+# --------------------------------------------------------------- transcribing
+transcribe() {
+    local -a args=(
+        -sS --max-time 180 --fail-with-body
+        "$WHISPER_URL"
+        -H "Authorization: Bearer ${WHISPER_API_KEY}"
+        -F "file=@${WAVFILE}"
+        -F "model=${WHISPER_MODEL}"
+        -F "language=${WHISPER_LANGUAGE}"
+        -F "response_format=json"
+    )
+    if [ -n "$WHISPER_PROMPT" ]; then
+        args+=(-F "prompt=${WHISPER_PROMPT}")
+    fi
+
+    curl "${args[@]}"
+}
+
+extract_text() {
+    python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+try:
+    obj = json.loads(raw)
+except json.JSONDecodeError:
+    # whisper.cpp / plain-text servers sometimes return bare text
+    print(raw)
+    sys.exit(0)
+if isinstance(obj, dict):
+    for key in ("error", "detail"):          # OpenAI-style / FastAPI-style errors
+        if key in obj:
+            sys.stderr.write(str(obj[key]) + "\n")
+            sys.exit(1)
+    text = obj.get("text") or obj.get("transcription") or ""
+    if not text and isinstance(obj.get("segments"), list):
+        text = "".join(s.get("text", "") for s in obj["segments"])
+    print(text.strip())
+else:
+    print(str(obj).strip())
+'
+}
+
+# Whisper reliably hallucinates a handful of stock phrases when handed silence.
+is_junk() {
+    local t
+    t=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:punct:][:space:]')
+    case "$t" in
+        ""|you|thankyou|thanks|thanksforwatching|bye|okay|uh|um|subscribe) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# -------------------------------------------------------------------- output
+to_clipboard() {
+    local text="$1"
+    if [ "${XDG_SESSION_TYPE:-}" = "wayland" ] && command -v wl-copy >/dev/null 2>&1; then
+        printf '%s' "$text" | wl-copy
+    elif command -v xclip >/dev/null 2>&1; then
+        # xclip forks to serve the selection; drop its fds so nothing waiting
+        # on our stdout (a launcher, a pipe) hangs until the clipboard changes.
+        printf '%s' "$text" | xclip -selection clipboard >/dev/null 2>&1
+    elif command -v xsel >/dev/null 2>&1; then
+        printf '%s' "$text" | xsel --clipboard --input
+    else
+        die "no clipboard tool found (install xclip or wl-clipboard)"
+    fi
+}
+
+# Terminals take Ctrl+Shift+V; Ctrl+V is a literal control character there.
+active_window_is_terminal() {
+    local cls
+    cls=$(xprop -id "$(xdotool getactivewindow 2>/dev/null)" WM_CLASS 2>/dev/null) || return 1
+    case "${cls,,}" in
+        *kitty*|*alacritty*|*wezterm*|*gnome-terminal*|*ptyxis*|*konsole*|*xterm*|\
+        *urxvt*|*tilix*|*terminator*|*foot*|*"\"st\""*|*terminal*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+paste_text() {
+    local text="$1"
+    [ "$AUTO_PASTE" = "1" ] || return 0
+    sleep 0.1
+    if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
+        # Raw evdev keycodes: 29=LEFTCTRL, 47=V
+        command -v ydotool >/dev/null 2>&1 && ydotool key 29:1 47:1 47:0 29:0 || true
+    elif command -v xdotool >/dev/null 2>&1; then
+        # --clearmodifiers releases whatever modifiers the hotkey left held.
+        if [ "$PASTE_MODE" = "type" ]; then
+            xdotool type --clearmodifiers --delay 5 -- "$text" || true
+        elif active_window_is_terminal; then
+            xdotool key --clearmodifiers ctrl+shift+v || true
+        else
+            xdotool key --clearmodifiers ctrl+v || true
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------- main
+case "${1:-toggle}" in
+    cancel)
+        stop_recording 2>/dev/null || true
+        rm -f "$WAVFILE"
+        notify "Cancelled" 1200
+        exit 0
+        ;;
+    stop)
+        stop_recording || exit 0
+        ;;
+    toggle)
+        # A pidfile whose process has already exited (recorder crashed, or the
+        # watchdog is mid-stop) still means "finish and transcribe", not "start".
+        if [ -f "$PIDFILE" ]; then
+            stop_recording
+        else
+            start_recording
+            exit 0
+        fi
+        ;;
+    *)
+        echo "usage: $(basename "$0") [toggle|stop|cancel]" >&2
+        exit 2
+        ;;
+esac
+
+[ -s "$WAVFILE" ] || die "nothing recorded"
+
+# Under about a third of a second there is no speech worth sending.
+bytes=$(stat -c%s "$WAVFILE")
+if [ "$bytes" -lt 12000 ]; then
+    rm -f "$WAVFILE"
+    notify "Too short" 1200
+    exit 0
+fi
+
+cue "$SOUND_TRANSCRIBING"
+notify "Transcribing…" 1200
+
+if ! response=$(transcribe); then
+    die "transcription request failed: ${response:-could not reach $WHISPER_URL}"
+fi
+text=$(printf '%s' "$response" | extract_text) || die "transcription failed: $response"
+
+rm -f "$WAVFILE"
+
+if is_junk "$text"; then
+    notify "Nothing heard" 1500
+    exit 0
+fi
+
+to_clipboard "$text"
+paste_text "$text"
+cue "$SOUND_DONE"
+
+# Truncate the notification so a long dictation does not fill the screen.
+preview="$text"
+[ "${#preview}" -gt 90 ] && preview="${preview:0:90}…"
+notify "$preview" 3000
