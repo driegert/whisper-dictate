@@ -13,8 +13,8 @@ with a Whisper server on your own machine or LAN, or with OpenAI's API.
 |---|---|---|
 | Recording | `pipewire-bin` (`pw-record`) | `pulseaudio-utils` or `alsa-utils` also work |
 | Upload / parse | `curl`, `python3` | almost certainly installed already |
-| Clipboard | `xclip` on X11, `wl-clipboard` on Wayland | |
-| Auto-paste | `xdotool` + `x11-utils` on X11, `ydotool` on Wayland | optional; set `AUTO_PASTE=0` without it |
+| Clipboard | `wl-clipboard` on Wayland, `xclip` on X11 | |
+| Auto-paste | X11: `xdotool` + `x11-utils`. Wayland: `ydotool` (GNOME, KDE) or `wtype` (sway, Hyprland, niri) | optional; set `AUTO_PASTE=0` without it; see [Wayland](#wayland) |
 | Notifications | `libnotify-bin` | optional |
 | Sound cues | `libcanberra-gtk3-module` or `pulseaudio-utils`, plus `sound-theme-freedesktop` | optional |
 
@@ -25,9 +25,10 @@ sudo apt install pipewire-bin curl python3 xclip xdotool x11-utils libnotify-bin
                  libcanberra-gtk3-module sound-theme-freedesktop
 ```
 
-Check which session type you have with `echo $XDG_SESSION_TYPE`. On Wayland,
-`ydotool` needs its daemon running and permission on `/dev/uinput`; see its
-documentation. Everything else works the same.
+The script works out at run time whether it is on X11 or Wayland and which
+compositor is running, and uses the matching tools. `whisper-dictate check`
+prints what it found and what is missing. Wayland needs one or two extra
+packages depending on the compositor; see [Wayland](#wayland).
 
 ## Install
 
@@ -39,6 +40,74 @@ chmod +x ~/.local/bin/whisper-dictate
 
 `~/.local/bin` is on the PATH by default on most distributions. Any location
 works as long as the hotkey points at the full path.
+
+## Wayland
+
+Wayland has no standard way to inject keystrokes or to ask which window has
+focus, so both jobs need a compositor-specific tool. The script picks one
+from the session it finds itself in:
+
+| Compositor | Paste keystrokes with | Focused-window lookup |
+|---|---|---|
+| GNOME | `ydotool`, else `xdotool` through Xwayland | Window Calls extension, else the accessibility bus |
+| KDE Plasma | `ydotool`, else `wtype` | `kdotool` |
+| sway, Hyprland, niri | `wtype`, else `ydotool` | the compositor's own IPC |
+
+Run `whisper-dictate check` after installing. It shows the session and
+compositor it detected, the recorder, clipboard, and paste tools it will use,
+why any candidate is unusable, what it thinks the focused window is, and
+whether the server answers.
+
+**GNOME.** ydotool drives a virtual keyboard through `/dev/uinput`, so it
+needs its daemon running and access to that device:
+
+```sh
+sudo apt install ydotool
+sudo usermod -aG input "$USER"
+systemctl --user enable ydotool
+```
+
+Then log out and back in so the group change and the package's udev rule take
+effect, and confirm with `whisper-dictate check`. If it still says `ydotoold
+is not running`, check `journalctl --user -u ydotool`: a failure to open
+`/dev/uinput` after a re-login means the group did not reach your user
+session. That happens when something survives the logout (a tmux, herdr, or
+similar server) and keeps the old `systemd --user` manager alive; user
+services inherit its groups. Reboot, or kill the survivor before logging out.
+
+An alternative that needs no daemon or group is `sudo apt install xdotool`:
+Xwayland forwards its synthetic keys to GNOME through libei. GNOME asks once
+per login whether to allow it, and the first paste after logging in may be
+lost while that dialog is up.
+
+Telling terminals apart from other apps (Ctrl+Shift+V versus Ctrl+V) is the
+harder part on GNOME, which does not expose the focused window. GTK, Qt, and
+Electron apps, including Ptyxis, GNOME Terminal, and Console, announce their
+active window on the accessibility bus, and the script reads that. kitty,
+alacritty, and foot do not register there, so they receive Ctrl+V unless the
+[Window Calls](https://extensions.gnome.org/extension/4724/window-calls/)
+extension is installed; the script uses it whenever it is present. The
+blunt alternative is to make the terminal accept Ctrl+V as well; for kitty
+that is one line in `kitty.conf`:
+
+```
+map ctrl+v paste_from_clipboard
+```
+
+It costs readline's quoted-insert and Vim's visual-block key (`ctrl+q` does
+the same in Vim). Sending Ctrl+Shift+V everywhere is not an option: browsers
+treat it as paste-as-plain-text, which is harmless, but VS Code opens a
+Markdown preview, LibreOffice opens Paste Special, JetBrains opens the
+clipboard history, and plain GTK and Qt entries ignore it.
+
+**KDE Plasma.** The same ydotool steps as GNOME. Install `kdotool` for the
+focused-window lookup.
+
+**sway, Hyprland, niri.** `sudo apt install wtype`. Nothing else to set up;
+the focused window comes from `swaymsg`, `hyprctl`, or `niri msg`.
+
+`PASTE_TOOL=ydotool` (or `xdotool`, `wtype`, `none`) in the config overrides
+the automatic choice.
 
 ## A transcription server
 
@@ -137,8 +206,8 @@ transcribed as normal. Recordings under a third of a second are ignored, as are
 the stock phrases Whisper produces from silence ("Thank you.", "you").
 
 In terminals the script sends Ctrl+Shift+V instead of Ctrl+V. If an app takes
-neither, set `PASTE_MODE=type` to have the text typed in keystroke by keystroke
-(X11 only), or `AUTO_PASTE=0` and paste by hand.
+neither, set `PASTE_MODE=type` to have the text typed in keystroke by
+keystroke, or `AUTO_PASTE=0` and paste by hand.
 
 ## Troubleshooting
 
@@ -146,9 +215,15 @@ neither, set `PASTE_MODE=type` to have the text typed in keystroke by keystroke
   few seconds apart. Errors print to stderr and also appear as notifications.
 - **"could not reach ..."** The server is down or the URL is wrong. Try the
   curl line above.
-- **Text lands on the clipboard but is not pasted.** On X11, check that
-  `xdotool` and `xprop` are installed. On Wayland, check `ydotool` and its
-  daemon. Pasting works only in the window that had focus when you pressed stop.
+- **Text lands on the clipboard but is not pasted.** Run `whisper-dictate
+  check`; it names the paste tool it chose, or says why none is usable. The
+  notification after a dictation also says so. Pasting works only in the
+  window that had focus when you pressed stop.
+- **Pasted into a terminal as a stray `^V`, or nothing arrived in kitty.** The
+  focused-window lookup did not recognise the terminal, so Ctrl+V was sent.
+  `whisper-dictate check` shows what it sees as the focused window; on GNOME
+  see [Wayland](#wayland) for the Window Calls extension or the kitty
+  `map ctrl+v` workaround.
 - **Wrong microphone.** The script records from the system default input.
   Change it in your sound settings or with `wpctl set-default <id>`.
 - **Cues too loud.** Lower `SOUND_VOLUME`, or set an individual cue to `""`.

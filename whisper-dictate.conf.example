@@ -12,7 +12,9 @@ WHISPER_LANGUAGE="en"
 WHISPER_PROMPT="Your Name, Your Employer, your city, your field's jargon."
 
 AUTO_PASTE=1        # paste into the focused window; 0 = clipboard only
-PASTE_MODE=key      # key = Ctrl+V (Ctrl+Shift+V in terminals); type = xdotool type
+PASTE_MODE=key      # key = Ctrl+V (Ctrl+Shift+V in terminals); type = type it keystroke by keystroke
+PASTE_TOOL=auto     # auto = pick by session and compositor (see `whisper-dictate check`);
+                    # or force one of: xdotool, ydotool, wtype, none
 MAX_SECONDS=300     # auto-stop and transcribe after this long
 
 SOUND=1             # 0 = silent

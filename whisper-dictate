@@ -8,12 +8,14 @@
 # clipboard). No daemon, no background process between uses.
 #
 # Dependencies: curl, python3, and one of pw-record / parecord / arecord.
-#               xclip / xsel (X11) or wl-copy (Wayland) for the clipboard.
-#               xdotool + xprop (X11) or ydotool (Wayland) for AUTO_PASTE=1.
+#               Clipboard: wl-copy (Wayland) or xclip / xsel (X11).
+#               Auto-paste: xdotool + xprop on X11; on Wayland ydotool, wtype,
+#               or xdotool depending on the compositor. Run
+#               `whisper-dictate check` to see what this session can use.
 #               notify-send (optional) for feedback.
 #               canberra-gtk-play or paplay (optional) for sound cues.
 #
-# Usage: whisper-dictate [toggle|stop|cancel]
+# Usage: whisper-dictate [toggle|stop|cancel|check]
 
 set -uo pipefail
 
@@ -28,8 +30,8 @@ if [ -r "$CONF" ]; then
     # restore the snapshot so explicit env vars (a second hotkey, a test run)
     # still win.
     _env=$(declare -p WHISPER_URL WHISPER_MODEL WHISPER_API_KEY WHISPER_LANGUAGE \
-                      WHISPER_PROMPT AUTO_PASTE PASTE_MODE MAX_SECONDS SOUND \
-                      SOUND_VOLUME SOUND_START SOUND_TRANSCRIBING SOUND_DONE \
+                      WHISPER_PROMPT AUTO_PASTE PASTE_MODE PASTE_TOOL MAX_SECONDS \
+                      SOUND SOUND_VOLUME SOUND_START SOUND_TRANSCRIBING SOUND_DONE \
                       SOUND_ERROR 2>/dev/null)
     # shellcheck source=/dev/null
     . "$CONF"
@@ -48,8 +50,12 @@ WHISPER_PROMPT="${WHISPER_PROMPT:-}"
 
 AUTO_PASTE="${AUTO_PASTE:-1}"      # 1 = paste into the focused window after copying
 PASTE_MODE="${PASTE_MODE:-key}"    # key  = simulate Ctrl+V (Ctrl+Shift+V in terminals)
-                                   # type = type the text keystroke by keystroke (X11 only;
-                                   #        works everywhere, slower on long text)
+                                   # type = type the text keystroke by keystroke
+                                   #        (works in apps that take no paste key;
+                                   #        slower on long text)
+PASTE_TOOL="${PASTE_TOOL:-auto}"   # auto | xdotool | ydotool | wtype | none
+                                   # auto picks per session/compositor, see
+                                   # choose_paste_tool below
 MAX_SECONDS="${MAX_SECONDS:-300}"  # auto-stop and transcribe after this long
 
 # Sound cues: names from the freedesktop sound theme
@@ -67,6 +73,50 @@ mkdir -p "$RUNTIME"
 PIDFILE="$RUNTIME/record.pid"
 WAVFILE="$RUNTIME/record.wav"
 NIDFILE="$RUNTIME/notify.id"
+
+# ------------------------------------------------------- session / compositor
+# Everything that touches the display (clipboard, synthetic keystrokes, "is
+# the focused window a terminal?") differs between X11 and Wayland, and on
+# Wayland between compositors: Wayland has no shared protocol for injecting
+# input or for asking which window has focus, so each compositor family needs
+# its own tool. Detect once, up front, and let every display-facing function
+# branch on these two variables.
+#
+#   SESSION  x11 | wayland | unknown
+#   DESKTOP  gnome | kde | sway | hyprland | niri | other
+
+detect_session() {
+    SESSION="${XDG_SESSION_TYPE:-}"
+    case "$SESSION" in
+        x11|wayland) ;;
+        *)
+            if   [ -n "${WAYLAND_DISPLAY:-}" ]; then SESSION=wayland
+            elif [ -n "${DISPLAY:-}" ];         then SESSION=x11
+            else
+                SESSION=$(loginctl show-session auto -p Type --value 2>/dev/null)
+                case "$SESSION" in x11|wayland) ;; *) SESSION=unknown ;; esac
+            fi
+            ;;
+    esac
+
+    # A compositor's own socket variable is the most reliable tell; the
+    # desktop name (e.g. "ubuntu:GNOME", "KDE") is the fallback.
+    if   [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then DESKTOP=hyprland
+    elif [ -n "${SWAYSOCK:-}" ];                    then DESKTOP=sway
+    elif [ -n "${NIRI_SOCKET:-}" ];                 then DESKTOP=niri
+    else
+        local names="${XDG_CURRENT_DESKTOP:-}:${DESKTOP_SESSION:-}"
+        case ":${names,,}:" in
+            *gnome*)        DESKTOP=gnome ;;
+            *kde*|*plasma*) DESKTOP=kde ;;
+            *hyprland*)     DESKTOP=hyprland ;;
+            *sway*)         DESKTOP=sway ;;
+            *niri*)         DESKTOP=niri ;;
+            *) if [ -n "${KDE_FULL_SESSION:-}" ]; then DESKTOP=kde; else DESKTOP=other; fi ;;
+        esac
+    fi
+}
+detect_session
 
 # ------------------------------------------------------------------- feedback
 # One notification slot, replaced in place, so a dictation doesn't leave a
@@ -96,19 +146,24 @@ cue() {
 die() { cue "$SOUND_ERROR"; notify "whisper-dictate: $1" 5000; echo "$1" >&2; exit 1; }
 
 # ------------------------------------------------------------------ recording
+recorder() {
+    local r
+    for r in pw-record parecord arecord; do
+        command -v "$r" >/dev/null 2>&1 && { echo "$r"; return 0; }
+    done
+    return 1
+}
+
 start_recording() {
     rm -f "$WAVFILE"
 
-    if command -v pw-record >/dev/null 2>&1; then
-        pw-record --rate 16000 --channels 1 --format s16 "$WAVFILE" &
-    elif command -v parecord >/dev/null 2>&1; then
-        parecord --rate=16000 --channels=1 --format=s16le \
-                 --file-format=wav "$WAVFILE" &
-    elif command -v arecord >/dev/null 2>&1; then
-        arecord -q -f S16_LE -r 16000 -c 1 -t wav "$WAVFILE" &
-    else
-        die "no recorder found (install pipewire-utils, pulseaudio-utils, or alsa-utils)"
-    fi
+    case "$(recorder)" in
+        pw-record) pw-record --rate 16000 --channels 1 --format s16 "$WAVFILE" & ;;
+        parecord)  parecord --rate=16000 --channels=1 --format=s16le \
+                            --file-format=wav "$WAVFILE" & ;;
+        arecord)   arecord -q -f S16_LE -r 16000 -c 1 -t wav "$WAVFILE" & ;;
+        *) die "no recorder found (install pipewire-bin, pulseaudio-utils, or alsa-utils)" ;;
+    esac
 
     local pid=$!
     echo "$pid" > "$PIDFILE"
@@ -195,54 +250,323 @@ is_junk() {
     esac
 }
 
-# -------------------------------------------------------------------- output
-to_clipboard() {
-    local text="$1"
-    if [ "${XDG_SESSION_TYPE:-}" = "wayland" ] && command -v wl-copy >/dev/null 2>&1; then
-        printf '%s' "$text" | wl-copy
-    elif command -v xclip >/dev/null 2>&1; then
-        # xclip forks to serve the selection; drop its fds so nothing waiting
-        # on our stdout (a launcher, a pipe) hangs until the clipboard changes.
-        printf '%s' "$text" | xclip -selection clipboard >/dev/null 2>&1
-    elif command -v xsel >/dev/null 2>&1; then
-        printf '%s' "$text" | xsel --clipboard --input
-    else
-        die "no clipboard tool found (install xclip or wl-clipboard)"
-    fi
+# ------------------------------------------------------------------ clipboard
+clipboard_tool() {
+    local -a order
+    case "$SESSION" in
+        wayland) order=(wl-copy xclip xsel) ;;  # xclip still works through Xwayland
+        *)       order=(xclip xsel wl-copy) ;;
+    esac
+    local t
+    for t in "${order[@]}"; do
+        command -v "$t" >/dev/null 2>&1 && { echo "$t"; return 0; }
+    done
+    return 1
 }
 
+to_clipboard() {
+    local text="$1"
+    # wl-copy and xclip fork to serve the selection; drop their fds so nothing
+    # waiting on our stdout (a launcher, a pipe) hangs until the clipboard
+    # changes.
+    case "$(clipboard_tool)" in
+        wl-copy) printf '%s' "$text" | wl-copy >/dev/null 2>&1 ;;
+        xclip)   printf '%s' "$text" | xclip -selection clipboard >/dev/null 2>&1 ;;
+        xsel)    printf '%s' "$text" | xsel --clipboard --input ;;
+        *) die "no clipboard tool found (install wl-clipboard or xclip)" ;;
+    esac
+}
+
+# ------------------------------------------------------------- focused window
 # Terminals take Ctrl+Shift+V; Ctrl+V is a literal control character there.
+# Each function prints the lower-cased class / app-id of the focused window
+# and fails if it cannot tell on this session.
+
+x11_active_class() {
+    local id
+    id=$(xdotool getactivewindow 2>/dev/null) ||
+        id=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | awk '{print $NF}')
+    case "${id:-}" in ""|0|0x0) return 1 ;; esac
+    if [ "$SESSION" = wayland ]; then
+        # Under Xwayland the X "active window" is whichever X client had focus
+        # last, even after focus moved to a native Wayland window; only trust
+        # it while the compositor still marks it focused.
+        xprop -id "$id" _NET_WM_STATE 2>/dev/null | grep -q _NET_WM_STATE_FOCUSED || return 1
+    fi
+    # Prints e.g. "kitty", "kitty" (instance, class); keep the quotes so a
+    # one-letter class like "st" can still be matched exactly.
+    xprop -id "$id" WM_CLASS 2>/dev/null | sed -n 's/^WM_CLASS([^)]*) = //p' | grep '"'
+}
+
+# GNOME keeps the Shell's window list private. Two ways around it: the
+# "Window Calls" extension, if installed, publishes it on D-Bus; otherwise the
+# accessibility bus knows which GTK / Qt / Electron window is active.
+# (kitty, alacritty and foot don't register on the accessibility bus.)
+gnome_active_class() {
+    local out
+    out=$(gdbus call --session --dest org.gnome.Shell \
+            --object-path /org/gnome/Shell/Extensions/Windows \
+            --method org.gnome.Shell.Extensions.Windows.List 2>/dev/null |
+          python3 -c '
+import ast, json, sys
+raw = sys.stdin.read().strip()
+if not raw:
+    sys.exit(1)
+for w in json.loads(ast.literal_eval(raw)[0]):      # gdbus prints ("<json>",)
+    if w.get("focus"):
+        print(w.get("wm_class") or w.get("wm_class_instance") or "")
+        break
+' 2>/dev/null)
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+
+    out=$(python3 - 2>/dev/null <<'EOF'
+import gi
+gi.require_version("Atspi", "2.0")
+from gi.repository import Atspi
+desk = Atspi.get_desktop(0)
+active = set()
+for i in range(desk.get_child_count()):
+    app = desk.get_child_at_index(i)
+    if app is None:
+        continue
+    for j in range(app.get_child_count()):
+        w = app.get_child_at_index(j)
+        if w is not None and w.get_state_set().contains(Atspi.StateType.ACTIVE):
+            active.add(app.get_name())
+# Some toolkits leave ACTIVE set on their last window; when more than one
+# app claims it we cannot tell which is right, so say nothing.
+if len(active) == 1:
+    print(active.pop())
+EOF
+)
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+    return 1
+}
+
+# wlroots-family compositors and KDE each expose focus through their own IPC.
+wl_active_class() {
+    case "$DESKTOP" in
+        hyprland) hyprctl -j activewindow | python3 -c \
+                      'import json,sys; print(json.load(sys.stdin).get("class",""))' ;;
+        sway)     swaymsg -t get_tree | python3 -c '
+import json, sys
+def walk(n):
+    if n.get("focused"):
+        print(n.get("app_id") or (n.get("window_properties") or {}).get("class") or "")
+        return True
+    return any(walk(c) for c in n.get("nodes", []) + n.get("floating_nodes", []))
+walk(json.load(sys.stdin))' ;;
+        niri)     niri msg --json focused-window | python3 -c \
+                      'import json,sys; print((json.load(sys.stdin) or {}).get("app_id",""))' ;;
+        kde)      kdotool getwindowclassname "$(kdotool getactivewindow)" ;;
+        *)        return 1 ;;
+    esac 2>/dev/null
+}
+
+# Describes the lookup method for `check`.
+focus_method() {
+    case "$SESSION/$DESKTOP" in
+        x11/*)            echo "xprop (X11)" ;;
+        wayland/gnome)    echo "GNOME: Window Calls extension, then accessibility bus, then xprop for Xwayland apps" ;;
+        wayland/hyprland) echo "hyprctl activewindow" ;;
+        wayland/sway)     echo "swaymsg get_tree" ;;
+        wayland/niri)     echo "niri msg focused-window" ;;
+        wayland/kde)      echo "kdotool" ;;
+        *)                echo "none (unknown compositor)" ;;
+    esac
+}
+
+active_window_class() {
+    local cls=""
+    case "$SESSION/$DESKTOP" in
+        x11/*)         cls=$(x11_active_class) ;;
+        wayland/gnome) cls=$(gnome_active_class) || cls=$(x11_active_class) ;;
+        wayland/*)     cls=$(wl_active_class)    || cls=$(x11_active_class) ;;
+    esac
+    [ -n "$cls" ] || return 1
+    printf '%s' "${cls,,}"
+}
+
 active_window_is_terminal() {
     local cls
-    cls=$(xprop -id "$(xdotool getactivewindow 2>/dev/null)" WM_CLASS 2>/dev/null) || return 1
-    case "${cls,,}" in
+    cls=$(active_window_class) || return 1
+    case "$cls" in
         *kitty*|*alacritty*|*wezterm*|*gnome-terminal*|*ptyxis*|*konsole*|*xterm*|\
-        *urxvt*|*tilix*|*terminator*|*foot*|*"\"st\""*|*terminal*) return 0 ;;
+        *urxvt*|*tilix*|*terminator*|*foot*|*ghostty*|*kgx*|*console*|*"\"st\""*|\
+        *terminal*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------- auto-paste
+# ydotool talks to a daemon (ydotoold) over a socket; without the daemon the
+# client just errors out, so "installed" is not enough.
+ydotool_socket() {
+    local s
+    for s in "${YDOTOOL_SOCKET:-}" "${XDG_RUNTIME_DIR:-}/.ydotool_socket" /tmp/.ydotool_socket; do
+        [ -n "$s" ] && [ -S "$s" ] && { echo "$s"; return 0; }
+    done
+    return 1
+}
+
+# Why a tool can't be used right now, or nothing if it can.
+paste_tool_problem() {
+    case "$1" in
+        xdotool)
+            command -v xdotool >/dev/null 2>&1 || { echo "not installed"; return; }
+            [ -n "${DISPLAY:-}" ] || echo "no X display (DISPLAY unset)" ;;
+        ydotool)
+            command -v ydotool >/dev/null 2>&1 || { echo "not installed"; return; }
+            ydotool_socket >/dev/null || echo "ydotoold is not running (no socket)" ;;
+        wtype)
+            command -v wtype >/dev/null 2>&1 || { echo "not installed"; return; }
+            [ -n "${WAYLAND_DISPLAY:-}" ] || echo "no Wayland display" ;;
+        none) ;;
+        *) echo "unknown tool" ;;
+    esac
+}
+
+# Candidates for this session, best first.
+#   X11:             xdotool (XTEST, always works).
+#   wlroots family:  wtype (virtual-keyboard protocol, no daemon), then ydotool.
+#   GNOME:           ydotool (uinput; needs ydotoold and /dev/uinput access),
+#                    then xdotool, whose XTEST events Xwayland forwards to the
+#                    compositor via libei (GNOME asks permission once per login).
+#   KDE:             ydotool, then wtype.
+paste_tool_candidates() {
+    case "$SESSION/$DESKTOP" in
+        x11/*)                                      echo xdotool ;;
+        wayland/sway|wayland/hyprland|wayland/niri) echo wtype ydotool ;;
+        wayland/gnome)                              echo ydotool xdotool ;;
+        wayland/kde)                                echo ydotool wtype ;;
+        *)                                          echo ydotool wtype xdotool ;;
+    esac
+}
+
+choose_paste_tool() {
+    if [ "$PASTE_TOOL" != "auto" ]; then echo "$PASTE_TOOL"; return; fi
+    local t
+    for t in $(paste_tool_candidates); do
+        [ -z "$(paste_tool_problem "$t")" ] && { echo "$t"; return; }
+    done
+    echo none
+}
+
+paste_setup_hint() {
+    case "$SESSION/$DESKTOP" in
+        x11/*)                                      echo "install xdotool and x11-utils" ;;
+        wayland/sway|wayland/hyprland|wayland/niri) echo "install wtype" ;;
+        wayland/*)                                  echo "install ydotool and enable ydotoold (see README)" ;;
+        *)                                          echo "no graphical session detected" ;;
+    esac
+}
+
+# $1 = tool, $2 = ctrl+v | ctrl+shift+v
+send_keys() {
+    case "$1" in
+        xdotool)
+            # --clearmodifiers releases whatever modifiers the hotkey left held.
+            xdotool key --clearmodifiers "$2" ;;
+        ydotool)
+            # Raw evdev keycodes: 29=LEFTCTRL, 42=LEFTSHIFT, 47=V
+            case "$2" in
+                ctrl+v)       ydotool key 29:1 47:1 47:0 29:0 ;;
+                ctrl+shift+v) ydotool key 29:1 42:1 47:1 47:0 42:0 29:0 ;;
+            esac ;;
+        wtype)
+            case "$2" in
+                ctrl+v)       wtype -M ctrl -k v -m ctrl ;;
+                ctrl+shift+v) wtype -M ctrl -M shift -k v -m shift -m ctrl ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+
+# $1 = tool, $2 = text
+type_text() {
+    case "$1" in
+        xdotool) xdotool type --clearmodifiers --delay 5 -- "$2" ;;
+        ydotool) printf '%s' "$2" | ydotool type --key-delay 5 --file - ;;
+        wtype)   printf '%s' "$2" | wtype -d 5 - ;;
         *) return 1 ;;
     esac
 }
 
 paste_text() {
-    local text="$1"
+    local text="$1" tool combo
     [ "$AUTO_PASTE" = "1" ] || return 0
+
+    tool=$(choose_paste_tool)
+    if [ "$tool" = none ]; then
+        notify "Copied to clipboard. No paste tool: $(paste_setup_hint)" 4000
+        echo "auto-paste unavailable on $SESSION/$DESKTOP: $(paste_setup_hint)" >&2
+        return 0
+    fi
+
     sleep 0.1
-    if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
-        # Raw evdev keycodes: 29=LEFTCTRL, 47=V
-        command -v ydotool >/dev/null 2>&1 && ydotool key 29:1 47:1 47:0 29:0 || true
-    elif command -v xdotool >/dev/null 2>&1; then
-        # --clearmodifiers releases whatever modifiers the hotkey left held.
-        if [ "$PASTE_MODE" = "type" ]; then
-            xdotool type --clearmodifiers --delay 5 -- "$text" || true
-        elif active_window_is_terminal; then
-            xdotool key --clearmodifiers ctrl+shift+v || true
-        else
-            xdotool key --clearmodifiers ctrl+v || true
-        fi
+    if [ "$PASTE_MODE" = "type" ]; then
+        type_text "$tool" "$text" >/dev/null 2>&1 && return 0
+    else
+        combo=ctrl+v
+        active_window_is_terminal && combo=ctrl+shift+v
+        send_keys "$tool" "$combo" >/dev/null 2>&1 && return 0
+    fi
+    notify "Copied to clipboard, but $tool could not paste ($(paste_tool_problem "$tool"))" 4000
+    echo "auto-paste with $tool failed; text is on the clipboard" >&2
+}
+
+# ------------------------------------------------------------------- check
+# `whisper-dictate check`: what this session detected and which tools it
+# will use. Run it after installing on a new machine.
+check() {
+    local t p cls code
+    printf '%-13s %s / %s\n' "session:" "$SESSION" "$DESKTOP"
+    printf '%-13s %s\n' "" "(XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-} XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-})"
+    printf '%-13s %s\n' "recorder:"  "$(recorder || echo 'NONE: install pipewire-bin, pulseaudio-utils, or alsa-utils')"
+    printf '%-13s %s\n' "clipboard:" "$(clipboard_tool || echo 'NONE: install wl-clipboard (Wayland) or xclip (X11)')"
+
+    t=$(choose_paste_tool)
+    if [ "$AUTO_PASTE" != "1" ]; then
+        printf '%-13s %s\n' "paste tool:" "disabled (AUTO_PASTE=0)"
+    elif [ "$t" = none ]; then
+        printf '%-13s %s\n' "paste tool:" "NONE: $(paste_setup_hint)"
+    elif [ "$PASTE_TOOL" != auto ] && [ -n "$(paste_tool_problem "$t")" ]; then
+        printf '%-13s %s\n' "paste tool:" "$t (PASTE_TOOL) but $(paste_tool_problem "$t")"
+    else
+        printf '%-13s %s\n' "paste tool:" "$t (mode: $PASTE_MODE)"
+    fi
+    for t in $(paste_tool_candidates); do
+        p=$(paste_tool_problem "$t")
+        printf '%-13s   %-8s %s\n' "" "$t" "${p:-ok}"
+    done
+
+    printf '%-13s %s\n' "focus query:" "$(focus_method)"
+    if cls=$(active_window_class); then
+        printf '%-13s focused now: %s\n' "" "$cls"
+    else
+        printf '%-13s focused now: unknown (Ctrl+V will be used, not Ctrl+Shift+V)\n' ""
+    fi
+
+    printf '%-13s %s\n' "notify:" "$(command -v notify-send >/dev/null 2>&1 && echo notify-send || echo 'none (install libnotify-bin)')"
+    printf '%-13s %s\n' "sounds:"  "$(command -v canberra-gtk-play >/dev/null 2>&1 && echo canberra-gtk-play || { command -v paplay >/dev/null 2>&1 && echo paplay || echo 'none'; })"
+
+    code=$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "$WHISPER_URL" 2>/dev/null)
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+        printf '%-13s %s (reachable, HTTP %s on GET)\n' "server:" "$WHISPER_URL" "$code"
+    else
+        printf '%-13s %s (UNREACHABLE)\n' "server:" "$WHISPER_URL"
     fi
 }
 
 # ---------------------------------------------------------------------- main
+# Sourced (for tests) rather than executed: define everything, run nothing.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
 case "${1:-toggle}" in
+    check)
+        check
+        exit 0
+        ;;
     cancel)
         stop_recording 2>/dev/null || true
         rm -f "$WAVFILE"
@@ -263,7 +587,7 @@ case "${1:-toggle}" in
         fi
         ;;
     *)
-        echo "usage: $(basename "$0") [toggle|stop|cancel]" >&2
+        echo "usage: $(basename "$0") [toggle|stop|cancel|check]" >&2
         exit 2
         ;;
 esac
