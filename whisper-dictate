@@ -121,12 +121,29 @@ detect_session
 # ------------------------------------------------------------------- feedback
 # One notification slot, replaced in place, so a dictation doesn't leave a
 # stack of "Recording… / Transcribing… / result" banners behind.
+# Usage: notify MESSAGE [TIMEOUT_MS] [URGENCY]
 notify() {
     command -v notify-send >/dev/null 2>&1 || return 0
-    local -a args=(-a whisper-dictate -t "${2:-2500}" -p)
+    local -a args=(-a whisper-dictate -t "${2:-2500}" -u "${3:-normal}" -p)
     local id
     id=$(cat "$NIDFILE" 2>/dev/null) && [ -n "$id" ] && args+=(-r "$id")
     notify-send "${args[@]}" "$1" > "$NIDFILE" 2>/dev/null || true
+}
+
+# Close the slot's notification. Needed for the sticky "Recording…" one:
+# GNOME Shell ignores the expire timeout, auto-hides normal banners after 4 s,
+# and shows none at all under Do Not Disturb. Only critical urgency gets a
+# banner that stays up, so that is what recording uses, and it has to be
+# taken down explicitly when recording ends.
+notify_close() {
+    local id
+    id=$(cat "$NIDFILE" 2>/dev/null) && [ -n "$id" ] || return 0
+    rm -f "$NIDFILE"
+    command -v gdbus >/dev/null 2>&1 || return 0
+    gdbus call --session --dest org.freedesktop.Notifications \
+        --object-path /org/freedesktop/Notifications \
+        --method org.freedesktop.Notifications.CloseNotification "$id" \
+        >/dev/null 2>&1 || true
 }
 
 # Play a theme sound in the background so it never adds latency to the hotkey
@@ -178,13 +195,16 @@ start_recording() {
     disown
 
     cue "$SOUND_START"
-    notify "Recording…" 1200
+    # Critical + no timeout: stays on screen (even under Do Not Disturb)
+    # until stop_recording closes it.
+    notify "Recording…" 0 critical
 }
 
 stop_recording() {
     local pid
     pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
     rm -f "$PIDFILE"
+    notify_close
 
     # SIGTERM, not SIGINT: background jobs started from a non-interactive
     # script have SIGINT ignored, so an INT would never reach the recorder.
